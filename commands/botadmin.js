@@ -1,6 +1,6 @@
 // commands/CreateStarRole.js
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const { IsOwner } = require('../helpers/RankCheck.js');
+const { IsOwner } = require('../helpers/RankChecker.js');
 
 module.exports = {
   data: new SlashCommandBuilder()
