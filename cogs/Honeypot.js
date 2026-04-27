@@ -63,6 +63,82 @@ CREATE TABLE IF NOT EXISTS honeypot (
 
 const GetHoneypot = Db.prepare(`SELECT * FROM honeypot WHERE guild_id = ?`);
 const DeleteHoneypot = Db.prepare(`DELETE FROM honeypot WHERE guild_id = ?`);
+const InsertGuildConfig = Db.prepare(`
+INSERT INTO honeypot (
+    guild_id,
+    channel_id,
+    enabled,
+    channel_name,
+    ban_reason,
+    delete_message_seconds,
+    embed_title,
+    embed_description,
+    embed_color,
+    embed_footer,
+    created_at,
+    updated_at
+) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+function LogFailure(Context, Error) {
+    if (!Config.LogFailedActions) return;
+    console.error(`[Honeypot] ${Context} failed:`, Error);
+}
+
+function EnsureGuildConfig(Guild) {
+    let Record = GetHoneypot.get(Guild.id);
+    if (Record) return Record;
+
+    const Now = Date.now();
+    InsertGuildConfig.run(
+        Guild.id,
+        Config.DefaultEnabled,
+        Config.DefaultChannelName,
+        Config.DefaultBanReason,
+        Config.DefaultDeleteMessageSeconds,
+        Config.DefaultEmbedTitle,
+        Config.DefaultEmbedDescription,
+        Config.DefaultEmbedColor,
+        Config.DefaultEmbedFooter,
+        Now,
+        Now
+    );
+
+    return GetHoneypot.get(Guild.id);
+}
+
+function UpdateGuildConfig(GuildId, Updates) {
+    const AllowedColumns = new Set([
+        "channel_id",
+        "enabled",
+        "channel_name",
+        "ban_reason",
+        "delete_message_seconds",
+        "embed_title",
+        "embed_description",
+        "embed_color",
+        "embed_footer"
+    ]);
+
+    const Entries = Object.entries(Updates)
+        .filter(([Key, Value]) => AllowedColumns.has(Key) && Value !== undefined);
+
+    if (Entries.length === 0) {
+        return GetHoneypot.get(GuildId);
+    }
+
+    const Sets = Entries.map(([Key]) => `${Key} = ?`);
+    const Values = Entries.map(([, Value]) => Value);
+    Values.push(Date.now(), GuildId);
+
+    Db.prepare(`
+        UPDATE honeypot
+        SET ${Sets.join(", ")}, updated_at = ?
+        WHERE guild_id = ?
+    `).run(...Values);
+
+    return GetHoneypot.get(GuildId);
+}
 
 async function EnsureHoneypotChannel(Guild) {
     let Record = GetHoneypot.get(Guild.id);
@@ -220,8 +296,8 @@ module.exports = {
 
         try {
             await Message.member.ban({
-                reason: 'Honeypot Triggered',
-                deleteMessageSeconds: 604800 
+                reason: Record.ban_reason,
+                deleteMessageSeconds: Record.delete_message_seconds
             });
 
             console.log(`[Honeypot] Banned ${Message.author.tag} for typing in honeypot.`);
