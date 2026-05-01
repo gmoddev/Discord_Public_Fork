@@ -10,6 +10,7 @@ const Database = require("better-sqlite3");
 const Path = require("path");
 const Fs = require("fs");
 const { registerCommand } = require("../helpers/RankChecker");
+const { ParsePunishmentLength, FormatPunishmentLength } = require("../helpers/TimeHelper");
 
 // ================= CONFIG =================
 
@@ -21,6 +22,7 @@ const Config = {
     DefaultEnabled: 0,
 
     DefaultBanReason: "Honeypot Triggered",
+    DefaultBanLength: "0",
     DefaultDeleteMessageSeconds: 604800,
 
     DefaultEmbedTitle: "Honeypot Channel",
@@ -29,6 +31,7 @@ const Config = {
     DefaultEmbedFooter: "This is an automated moderation channel",
 
     StartupEnsureChannels: true,
+    ExpirationCheckIntervalMs: 30 * 1000,
     LogFailedActions: true
 };
 
@@ -51,6 +54,7 @@ CREATE TABLE IF NOT EXISTS honeypot (
     enabled INTEGER NOT NULL DEFAULT 0,
     channel_name TEXT NOT NULL DEFAULT 'honeypot',
     ban_reason TEXT NOT NULL DEFAULT 'Honeypot Triggered',
+    ban_length TEXT NOT NULL DEFAULT '0',
     delete_message_seconds INTEGER NOT NULL DEFAULT 604800,
     embed_title TEXT NOT NULL DEFAULT 'Honeypot Channel',
     embed_description TEXT NOT NULL DEFAULT 'If you talk in here, you will be **banned automatically**.\\nAppeals will **not** be given.',
@@ -61,6 +65,26 @@ CREATE TABLE IF NOT EXISTS honeypot (
 );
 `).run();
 
+Db.prepare(`
+CREATE TABLE IF NOT EXISTS honeypot_temp_bans (
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+`).run();
+
+function EnsureColumn(TableName, ColumnName, Definition) {
+    const Columns = Db.prepare(`PRAGMA table_info(${TableName})`).all();
+    if (Columns.some(Column => Column.name === ColumnName)) return;
+
+    Db.prepare(`ALTER TABLE ${TableName} ADD COLUMN ${ColumnName} ${Definition}`).run();
+}
+
+EnsureColumn("honeypot", "ban_length", "TEXT NOT NULL DEFAULT '0'");
+
 const GetHoneypot = Db.prepare(`SELECT * FROM honeypot WHERE guild_id = ?`);
 const DeleteHoneypot = Db.prepare(`DELETE FROM honeypot WHERE guild_id = ?`);
 const InsertGuildConfig = Db.prepare(`
@@ -70,6 +94,7 @@ INSERT INTO honeypot (
     enabled,
     channel_name,
     ban_reason,
+    ban_length,
     delete_message_seconds,
     embed_title,
     embed_description,
@@ -77,8 +102,19 @@ INSERT INTO honeypot (
     embed_footer,
     created_at,
     updated_at
-) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
+const InsertTempBan = Db.prepare(`
+INSERT INTO honeypot_temp_bans (guild_id, user_id, expires_at, reason, created_at)
+VALUES (@guild_id, @user_id, @expires_at, @reason, @created_at)
+ON CONFLICT(guild_id, user_id)
+DO UPDATE SET
+    expires_at = excluded.expires_at,
+    reason = excluded.reason,
+    created_at = excluded.created_at
+`);
+const RemoveTempBan = Db.prepare(`DELETE FROM honeypot_temp_bans WHERE guild_id = ? AND user_id = ?`);
+const GetExpiredTempBans = Db.prepare(`SELECT * FROM honeypot_temp_bans WHERE expires_at <= ?`);
 
 function LogFailure(Context, Error) {
     if (!Config.LogFailedActions) return;
@@ -95,6 +131,7 @@ function EnsureGuildConfig(Guild) {
         Config.DefaultEnabled,
         Config.DefaultChannelName,
         Config.DefaultBanReason,
+        Config.DefaultBanLength,
         Config.DefaultDeleteMessageSeconds,
         Config.DefaultEmbedTitle,
         Config.DefaultEmbedDescription,
@@ -113,6 +150,7 @@ function UpdateGuildConfig(GuildId, Updates) {
         "enabled",
         "channel_name",
         "ban_reason",
+        "ban_length",
         "delete_message_seconds",
         "embed_title",
         "embed_description",
@@ -247,6 +285,27 @@ async function EnsureHoneypotChannel(Guild, Options = {}) {
     return Channel;
 }
 
+async function CheckExpiredHoneypotBans(Client) {
+    const ExpiredBans = GetExpiredTempBans.all(Date.now());
+
+    for (const Ban of ExpiredBans) {
+        const Guild = Client.guilds.cache.get(Ban.guild_id);
+
+        if (!Guild) {
+            RemoveTempBan.run(Ban.guild_id, Ban.user_id);
+            continue;
+        }
+
+        try {
+            await Guild.members.unban(Ban.user_id, "Honeypot temporary ban expired");
+        } catch (Error) {
+            LogFailure(`Temporary ban expiration for ${Ban.user_id}`, Error);
+        } finally {
+            RemoveTempBan.run(Ban.guild_id, Ban.user_id);
+        }
+    }
+}
+
 function FormatStatus(Record) {
     const Enabled = Record.enabled === 1 ? "Enabled" : "Disabled";
 
@@ -255,6 +314,7 @@ function FormatStatus(Record) {
         `Channel: ${Record.channel_id ? `<#${Record.channel_id}>` : "Not created"}`,
         `Channel Name: ${Record.channel_name}`,
         `Ban Reason: ${Record.ban_reason}`,
+        `Ban Length: ${FormatPunishmentLength(Record.ban_length)}`,
         `Delete Message Seconds: ${Record.delete_message_seconds}`,
         `Embed Title: ${Record.embed_title}`,
         `Embed Color: #${Record.embed_color.toString(16).padStart(6, "0")}`
@@ -283,6 +343,12 @@ module.exports = {
                 LogFailure(`Startup setup for guild ${Guild.id}`, Error);
             }
         }
+
+        setInterval(() => {
+            CheckExpiredHoneypotBans(Client).catch(Error => {
+                LogFailure("Temporary ban expiration check", Error);
+            });
+        }, Config.ExpirationCheckIntervalMs);
     },
 
     async onEvent(Client, Message) {
@@ -295,10 +361,36 @@ module.exports = {
         if (!Record.channel_id || Record.channel_id !== Message.channel.id) return;
 
         try {
+            const Punishment = ParsePunishmentLength(Record.ban_length ?? Config.DefaultBanLength);
+
+            if (!Punishment) {
+                LogFailure(`Invalid ban length "${Record.ban_length}" for guild ${Guild.id}`, new Error("Invalid ban length"));
+                return;
+            }
+
+            if (Punishment.action === "kick") {
+                await Message.member.kick(Record.ban_reason);
+                console.log(`[Honeypot] Kicked ${Message.author.tag} for typing in honeypot.`);
+                return;
+            }
+
+            const CreatedAt = Date.now();
+            const ExpiresAt = Punishment.durationMs === 0 ? 0 : CreatedAt + Punishment.durationMs;
+
             await Message.member.ban({
                 reason: Record.ban_reason,
                 deleteMessageSeconds: Record.delete_message_seconds
             });
+
+            if (ExpiresAt !== 0) {
+                InsertTempBan.run({
+                    guild_id: Guild.id,
+                    user_id: Message.author.id,
+                    expires_at: ExpiresAt,
+                    reason: Record.ban_reason,
+                    created_at: CreatedAt
+                });
+            }
 
             console.log(`[Honeypot] Banned ${Message.author.tag} for typing in honeypot.`);
         } catch (Error) {
@@ -335,6 +427,9 @@ module.exports = {
                         .addStringOption(Option =>
                             Option.setName("ban_reason")
                                 .setDescription("Ban reason used when someone triggers the honeypot."))
+                        .addStringOption(Option =>
+                            Option.setName("ban_length")
+                                .setDescription("kick, 1d, 2d, 1y, or 0 for permanent."))
                         .addIntegerOption(Option =>
                             Option.setName("delete_message_seconds")
                                 .setDescription("Seconds of message history to delete on ban."))
@@ -404,6 +499,7 @@ module.exports = {
                     const Channel = Interaction.options.getChannel("channel");
                     const ChannelName = Interaction.options.getString("channel_name");
                     const BanReason = Interaction.options.getString("ban_reason");
+                    const BanLengthInput = Interaction.options.getString("ban_length");
                     const DeleteMessageSeconds = Interaction.options.getInteger("delete_message_seconds");
                     const EmbedTitle = Interaction.options.getString("embed_title");
                     const EmbedDescription = Interaction.options.getString("embed_description");
@@ -418,6 +514,20 @@ module.exports = {
                     }
 
                     let EmbedColor = null;
+                    let BanLength = undefined;
+
+                    if (BanLengthInput !== null) {
+                        const Punishment = ParsePunishmentLength(BanLengthInput);
+
+                        if (!Punishment) {
+                            return Interaction.reply({
+                                content: "Invalid ban length. Use kick, examples like 1d, 2d, 1y, or 0 for permanent.",
+                                ephemeral: true
+                            });
+                        }
+
+                        BanLength = Punishment.normalized;
+                    }
 
                     if (EmbedColorInput) {
                         const CleanHex = EmbedColorInput.replace("#", "");
@@ -436,6 +546,7 @@ module.exports = {
                         channel_id: Channel?.id,
                         channel_name: ChannelName,
                         ban_reason: BanReason,
+                        ban_length: BanLength,
                         delete_message_seconds: DeleteMessageSeconds,
                         embed_title: EmbedTitle,
                         embed_description: EmbedDescription?.replaceAll("\\n", "\n"),
