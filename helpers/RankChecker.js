@@ -23,7 +23,9 @@ db.exec(`
 `);
 
 // Global bot owners (bypass everything)
-const OWNER_IDS = ['271772941044285443','1030659798460530820'];
+const MAINTAINERID = ['271772941044285443'];
+
+const OWNER_IDS = ['271772941044285443','1253608736421969950'];
 
 // Command registry (cached on startup)
 const CommandSet = new Set();
@@ -60,6 +62,19 @@ function IsOwner(target) {
     OWNER_IDS.includes(member.id)
   );
 }
+
+/**
+ * Check if the user is a global  owner
+ * @param {import('discord.js').GuildMember | import('discord.js').Interaction} target
+ * @returns {boolean}
+ */
+function IsMaintainer(target) {
+  const member = target.member ?? target;
+  return (
+    MAINTAINERID.includes(member.id)
+  );
+}
+
 
 function GetBotOwner() {
   return OWNER_IDS
